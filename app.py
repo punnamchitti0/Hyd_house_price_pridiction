@@ -1,3 +1,4 @@
+
 import io
 from pathlib import Path
 
@@ -13,359 +14,551 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder
+
+
+# --------------------------------------------------
+# 1. STREAMLIT CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
-    page_title="Hyderabad House Price Predictor",
+    page_title="Hyderabad House Price Prediction",
     page_icon="🏠",
     layout="wide"
 )
 
-# Keep this CSV file in the same folder as app.py.
 DATASET_PATH = Path(__file__).parent / "Hyderbad_House_price.csv"
 
 
-def identify_columns(df):
-    """Identify the price, area, and location columns in the uploaded dataset."""
-    cols = list(df.columns)
-    lower = {c: str(c).strip().lower() for c in cols}
+# --------------------------------------------------
+# 2. LOAD DATASET
+# --------------------------------------------------
 
-    target = next(
-        (c for c in cols if "price" in lower[c] and "sqft" not in lower[c]),
-        None
-    )
+@st.cache_data
+def load_data(file_bytes=None):
 
-    # Prefer the actual property area column over rate-per-square-foot.
-    area = next((c for c in cols if "area" in lower[c]), None)
-    if area is None:
-        area = next(
-            (c for c in cols if any(x in lower[c] for x in ["sqft", "size"])),
-            None
+    if file_bytes is not None:
+        df = pd.read_csv(io.BytesIO(file_bytes))
+
+    elif DATASET_PATH.exists():
+        df = pd.read_csv(DATASET_PATH)
+
+    else:
+        raise FileNotFoundError(
+            "Hyderbad_House_price.csv not found. "
+            "Place it in the same folder as app.py."
         )
 
-    location = next(
-        (c for c in cols if any(
-            x in lower[c] for x in ["location", "locality", "city", "loc"]
-        )),
-        None
-    )
-    bedrooms = next(
-        (c for c in cols if "bed" in lower[c] or "bhk" in lower[c]),
-        None
-    )
-    bathrooms = next((c for c in cols if "bath" in lower[c]), None)
+    return df
 
-    if target is None:
-        numeric = df.select_dtypes(include=np.number).columns.tolist()
-        target = numeric[-1] if numeric else None
 
-    return {
-        "target": target,
-        "area": area,
-        "location": location,
-        "bedrooms": bedrooms,
-        "bathrooms": bathrooms
-    }
-
+# --------------------------------------------------
+# 3. DATA CLEANING
+# --------------------------------------------------
 
 def prepare_data(raw):
+
     df = raw.copy()
-    df.columns = [str(c).strip() for c in df.columns]
 
-    # Remove CSV index columns such as "Unnamed: 0".
-    df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
+    df.columns = df.columns.astype(str).str.strip()
 
-    mapping = identify_columns(df)
-    target = mapping["target"]
+    # Remove unnecessary index column
+    df = df.loc[
+        :,
+        ~df.columns.str.contains("^Unnamed", case=False)
+    ]
 
-    if target is None:
+    # Explicitly identify the target column
+    if "price(L)" not in df.columns:
+
         raise ValueError(
-            "Could not identify the house-price column. "
-            "Please include a column named Price or price(L)."
+            "The CSV must contain a price(L) column."
         )
 
-    df[target] = pd.to_numeric(df[target], errors="coerce")
+    target = "price(L)"
+
+    # Numerical columns
+    numeric_columns = [
+        "price(L)",
+        "rate_persqft",
+        "area_insqft"
+    ]
+
+    for col in numeric_columns:
+
+        if col in df.columns:
+
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", ""),
+                errors="coerce"
+            )
+
+    # Remove invalid prices
     df = df.drop_duplicates()
-    df = df[df[target].notna() & (df[target] > 0)]
 
-    if mapping["area"]:
-        df[mapping["area"]] = pd.to_numeric(
-            df[mapping["area"]], errors="coerce"
+    df = df[
+        df["price(L)"].notna() &
+        (df["price(L)"] > 0)
+    ]
+
+    if "area_insqft" in df.columns:
+
+        df = df[
+            df["area_insqft"].isna() |
+            (df["area_insqft"] > 100)
+        ]
+
+    if len(df) < 10:
+
+        raise ValueError(
+            "Not enough valid records to train the model."
         )
-        df = df[df[mapping["area"]].isna() | (df[mapping["area"]] > 100)]
 
-    if df.empty:
-        raise ValueError("No valid rows remain after cleaning. Check your CSV.")
-
-    # Fill missing numeric and categorical values.
+    # Fill missing numerical values
     for col in df.select_dtypes(include=np.number).columns:
-        df[col] = df[col].fillna(df[col].median())
 
+        df[col] = df[col].fillna(
+            df[col].median()
+        )
+
+    # Fill missing categorical values
     for col in df.select_dtypes(exclude=np.number).columns:
-        modes = df[col].mode()
-        fill_value = modes.iloc[0] if not modes.empty else "Unknown"
-        df[col] = df[col].fillna(fill_value).astype(str).str.strip()
 
-    return df, mapping
+        df[col] = (
+            df[col]
+            .fillna("Unknown")
+            .astype(str)
+            .str.strip()
+        )
 
+    return df, target
+
+
+# --------------------------------------------------
+# 4. TRAIN MACHINE LEARNING MODEL
+# --------------------------------------------------
 
 @st.cache_resource
-def train_model(data_json, target):
-    df = pd.read_json(io.StringIO(data_json), orient="records")
-    features = [c for c in df.columns if c != target]
+def train_model(data_json):
 
-    X = df[features]
+    df = pd.read_json(
+        io.StringIO(data_json),
+        orient="records"
+    )
+
+    target = "price(L)"
+
+    # Separate input and output
+    X = df.drop(columns=[target])
     y = df[target]
 
-    numeric = X.select_dtypes(include=np.number).columns.tolist()
-    categorical = X.select_dtypes(exclude=np.number).columns.tolist()
+    # Identify numerical and categorical columns
+    numerical_features = X.select_dtypes(
+        include=np.number
+    ).columns.tolist()
 
-    transformers = []
+    categorical_features = X.select_dtypes(
+        exclude=np.number
+    ).columns.tolist()
 
-    if numeric:
-        transformers.append((
-            "num",
-            Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler())
-            ]),
-            numeric
-        ))
+    # Numerical preprocessing
+    numerical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median"))
+    ])
 
-    if categorical:
-        transformers.append((
-            "cat",
-            Pipeline([
-                ("imputer", SimpleImputer(strategy="most_frequent")),
-                ("onehot", OneHotEncoder(handle_unknown="ignore"))
-            ]),
-            categorical
-        ))
+    # Categorical preprocessing
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore"))
+    ])
 
-    preprocessor = ColumnTransformer(transformers=transformers)
+    # Combine preprocessing
+    preprocessor = ColumnTransformer([
+        ("numeric", numerical_pipeline, numerical_features),
+        ("categorical", categorical_pipeline, categorical_features)
+    ])
 
+    # Random Forest model
     model = Pipeline([
         ("preprocessor", preprocessor),
+
         ("regressor", RandomForestRegressor(
-            n_estimators=180,
+            n_estimators=150,
+            max_depth=15,
             random_state=42,
-            max_depth=12,
             n_jobs=-1
         ))
     ])
 
+    # Split dataset
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+        X,
+        y,
+        test_size=0.2,
+        random_state=42
     )
 
+    # Train
     model.fit(X_train, y_train)
+
+    # Predict test data
     predictions = model.predict(X_test)
 
+    # Evaluation
     metrics = {
-        "R² score": r2_score(y_test, predictions),
-        "MAE (₹ lakh)": mean_absolute_error(y_test, predictions),
-        "RMSE (₹ lakh)": np.sqrt(mean_squared_error(y_test, predictions))
+        "R2 Score": r2_score(y_test, predictions),
+
+        "MAE": mean_absolute_error(
+            y_test, predictions
+        ),
+
+        "RMSE": np.sqrt(
+            mean_squared_error(y_test, predictions)
+        )
     }
 
-    return model, features, metrics
+    return model, X.columns.tolist(), metrics
 
+
+# --------------------------------------------------
+# 5. APPLICATION HEADER
+# --------------------------------------------------
 
 st.title("🏠 Hyderabad House Price Prediction")
-st.caption(
-    "Explore the Hyderabad housing dataset, understand market patterns, "
-    "and estimate a property's price."
+
+st.markdown(
+    """
+    ### Machine Learning Based House Price Estimator
+
+    Analyze Hyderabad property prices and predict
+    estimated house prices using Random Forest Regression.
+    """
 )
 
+st.divider()
+
+
+# --------------------------------------------------
+# 6. SIDEBAR
+# --------------------------------------------------
+
 with st.sidebar:
+
     st.header("📂 Dataset")
-    uploaded = st.file_uploader(
-        "Upload another house-price CSV (optional)",
+
+    uploaded_file = st.file_uploader(
+        "Upload another CSV (optional)",
         type=["csv"]
     )
-    st.caption(
-        "The included Hyderbad_House_price.csv file is loaded automatically. "
-        "Upload another CSV only if you want to replace it."
+
+    st.info(
+        "Your Hyderabad CSV is loaded automatically. "
+        "Upload another file only if you want to replace it."
     )
+
     st.divider()
-    st.write("**Project workflow**")
-    st.write("1. Load Hyderabad house-price CSV")
-    st.write("2. Clean the data")
-    st.write("3. Explore housing patterns")
-    st.write("4. Train a Random Forest model")
-    st.write("5. Predict house prices")
+
+    st.subheader("Project Workflow")
+
+    st.write("1. Dataset Loading")
+    st.write("2. Data Cleaning")
+    st.write("3. Exploratory Data Analysis")
+    st.write("4. Machine Learning")
+    st.write("5. House Price Prediction")
+
+
+# --------------------------------------------------
+# 7. MAIN APPLICATION
+# --------------------------------------------------
 
 try:
-    if uploaded is not None:
-        raw = pd.read_csv(uploaded)
-        st.sidebar.success("Using the CSV you uploaded.")
-    elif DATASET_PATH.exists():
-        raw = pd.read_csv(DATASET_PATH)
-        st.sidebar.success("Hyderbad_House_price.csv loaded successfully.")
-    else:
-        st.error(
-            "Dataset file not found. Keep Hyderbad_House_price.csv "
-            "in the same folder as app.py."
-        )
-        st.stop()
 
-    df, mapping = prepare_data(raw)
-    target = mapping["target"]
-
-    # The supplied dataset's price(L) column stores prices in lakh rupees.
-    price_is_lakh = "l" in str(target).lower() or "lakh" in str(target).lower()
-    price_unit = "₹ lakh" if price_is_lakh else "₹"
-
-    model, features, metrics = train_model(
-        df.to_json(orient="records"),
-        target
+    file_bytes = (
+        uploaded_file.getvalue()
+        if uploaded_file is not None
+        else None
     )
 
+    raw = load_data(file_bytes)
+
+    df, target = prepare_data(raw)
+
+    st.success(
+        f"Dataset successfully loaded! "
+        f"{len(df):,} valid property records found."
+    )
+
+    # Train model
+    model, features, metrics = train_model(
+        df.to_json(orient="records")
+    )
+
+    # Tabs
     tab1, tab2, tab3 = st.tabs([
         "📊 Dashboard",
         "🏡 Predict Price",
         "📁 Dataset"
     ])
 
+
+    # --------------------------------------------------
+    # TAB 1: DASHBOARD
+    # --------------------------------------------------
+
     with tab1:
-        st.subheader("Market overview")
+
+        st.header("📊 Housing Market Dashboard")
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Valid properties", f"{len(df):,}")
 
-        if price_is_lakh:
-            c2.metric("Average price", f"₹{df[target].mean():,.2f} L")
-            c3.metric("Median price", f"₹{df[target].median():,.2f} L")
-        else:
-            c2.metric("Average price", f"₹{df[target].mean():,.0f}")
-            c3.metric("Median price", f"₹{df[target].median():,.0f}")
+        c1.metric(
+            "Total Properties",
+            f"{len(df):,}"
+        )
 
-        c4.metric("Model R² score", f"{metrics['R² score']:.3f}")
+        c2.metric(
+            "Average Price",
+            f"₹{df[target].mean():.2f} L"
+        )
+
+        c3.metric(
+            "Median Price",
+            f"₹{df[target].median():.2f} L"
+        )
+
+        c4.metric(
+            "Model R² Score",
+            f"{metrics['R2 Score']:.3f}"
+        )
+
+        st.divider()
 
         left, right = st.columns(2)
 
+        # Price distribution
         with left:
-            st.markdown("**House price distribution**")
+
+            st.subheader("House Price Distribution")
+
             fig, ax = plt.subplots()
-            sns.histplot(df[target], kde=True, ax=ax)
-            ax.set_xlabel(f"Price ({price_unit})")
-            ax.set_ylabel("Number of properties")
+
+            sns.histplot(
+                df[target],
+                kde=True,
+                ax=ax
+            )
+
+            ax.set_xlabel("Price (₹ Lakhs)")
+            ax.set_ylabel("Number of Properties")
+
             st.pyplot(fig)
+
             plt.close(fig)
 
+        # Location analysis
         with right:
-            st.markdown("**Average price by location**")
-            if mapping["location"]:
-                loc = (
-                    df.groupby(mapping["location"])[target]
+
+            st.subheader("Average Price by Location")
+
+            if "location" in df.columns:
+
+                location_prices = (
+                    df.groupby("location")[target]
                     .mean()
                     .sort_values(ascending=False)
                     .head(12)
                 )
-                fig, ax = plt.subplots()
-                loc.plot(kind="bar", ax=ax)
-                ax.set_ylabel(f"Average price ({price_unit})")
-                ax.tick_params(axis="x", rotation=45)
-                st.pyplot(fig)
-                plt.close(fig)
-            else:
-                st.warning("No location column was detected in the CSV.")
 
-        st.markdown("**Model evaluation**")
-        metric_display = pd.DataFrame([metrics]).style.format({
-            "R² score": "{:.3f}",
-            "MAE (₹ lakh)": "₹{:.2f} lakh",
-            "RMSE (₹ lakh)": "₹{:.2f} lakh"
-        })
-        st.dataframe(metric_display, use_container_width=True)
-        st.caption(
-            "R², MAE and RMSE are calculated using a held-out test set. "
-            "The results depend on the supplied dataset."
+                fig, ax = plt.subplots()
+
+                location_prices.plot(
+                    kind="bar",
+                    ax=ax
+                )
+
+                ax.set_ylabel("Average Price (₹ Lakhs)")
+                ax.set_xlabel("Location")
+
+                plt.xticks(rotation=45)
+
+                st.pyplot(fig)
+
+                plt.close(fig)
+
+        st.divider()
+
+        # Model evaluation
+        st.subheader("🤖 Model Evaluation")
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric(
+            "R² Score",
+            f"{metrics['R2 Score']:.3f}"
         )
 
+        m2.metric(
+            "MAE",
+            f"₹{metrics['MAE']:.2f} L"
+        )
+
+        m3.metric(
+            "RMSE",
+            f"₹{metrics['RMSE']:.2f} L"
+        )
+
+        st.caption(
+            "Evaluation metrics are calculated using "
+            "a separate test dataset."
+        )
+
+
+    # --------------------------------------------------
+    # TAB 2: HOUSE PRICE PREDICTION
+    # --------------------------------------------------
+
     with tab2:
-        st.subheader("Estimate a house price")
+
+        st.header("🏡 Predict House Price")
+
         st.write(
-            "Enter the property details. The model uses the columns "
-            "available in your Hyderabad dataset."
+            "Enter the property details to estimate "
+            "its market price."
         )
 
         values = {}
-        cols = st.columns(2)
 
-        for i, col in enumerate(features):
-            with cols[i % 2]:
-                series = df[col]
+        col1, col2 = st.columns(2)
 
+        for i, feature in enumerate(features):
+
+            with (col1 if i % 2 == 0 else col2):
+
+                series = df[feature]
+
+                # Categorical features
                 if series.dtype == "object":
-                    options = sorted(series.astype(str).unique().tolist())
-                    values[col] = st.selectbox(
-                        col,
+
+                    options = sorted(
+                        series.unique().tolist()
+                    )
+
+                    values[feature] = st.selectbox(
+                        feature,
                         options,
-                        key=f"pred_{col}"
+                        key=f"input_{feature}"
                     )
-                elif (
-                    pd.api.types.is_integer_dtype(series)
-                    or series.nunique() <= 10
-                ):
-                    low = int(series.min())
-                    high = int(series.max())
-                    values[col] = st.number_input(
-                        col,
-                        min_value=low,
-                        max_value=max(low, high),
-                        value=int(series.median()),
-                        step=1,
-                        key=f"pred_{col}"
-                    )
+
+                # Numerical features
                 else:
+
                     low = float(series.min())
                     high = float(series.max())
-                    values[col] = st.number_input(
-                        col,
-                        min_value=float(max(0, low)),
-                        max_value=float(max(high, low + 1)),
-                        value=float(series.median()),
-                        key=f"pred_{col}"
-                    )
+
+                    if low == high:
+
+                        values[feature] = st.number_input(
+                            feature,
+                            value=low,
+                            disabled=True
+                        )
+
+                    else:
+
+                        values[feature] = st.number_input(
+                            feature,
+                            min_value=low,
+                            max_value=high,
+                            value=float(series.median()),
+                            key=f"input_{feature}"
+                        )
+
+        st.divider()
 
         if st.button(
-            "Predict House Price",
+            "🔍 Predict House Price",
             type="primary",
             use_container_width=True
         ):
-            prediction = float(
-                model.predict(pd.DataFrame([values], columns=features))[0]
+
+            input_df = pd.DataFrame(
+                [values],
+                columns=features
             )
 
-            if price_is_lakh:
-                st.success(f"Estimated house price: ₹{prediction:,.2f} lakh")
-                st.caption(
-                    f"Approximately ₹{prediction * 100000:,.0f}"
-                )
-            else:
-                st.success(f"Estimated house price: ₹{prediction:,.0f}")
+            prediction = float(
+                model.predict(input_df)[0]
+            )
+
+            st.success(
+                f"🏠 Estimated House Price: ₹{prediction:.2f} Lakhs"
+            )
+
+            st.info(
+                f"Approximate price in rupees: "
+                f"₹{prediction * 100000:,.0f}"
+            )
 
             st.caption(
-                "This is a machine-learning estimate, not a professional "
-                "property valuation."
+                "This prediction is an estimate based on "
+                "historical dataset patterns, not a professional valuation."
             )
 
-    with tab3:
-        st.subheader("Cleaned dataset preview")
-        st.write(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
-        st.dataframe(df.head(100), use_container_width=True)
 
-        cleaned_csv = df.to_csv(index=False).encode("utf-8")
+    # --------------------------------------------------
+    # TAB 3: DATASET
+    # --------------------------------------------------
+
+    with tab3:
+
+        st.header("📁 Hyderabad Housing Dataset")
+
+        st.write(
+            f"Total Rows: {len(df):,} | "
+            f"Total Columns: {len(df.columns)}"
+        )
+
+        st.subheader("Dataset Preview")
+
+        st.dataframe(
+            df.head(100),
+            use_container_width=True
+        )
+
+        st.subheader("Column Information")
+
+        information = pd.DataFrame({
+            "Column": df.columns,
+            "Data Type": df.dtypes.astype(str).values,
+            "Missing Values": df.isnull().sum().values
+        })
+
+        st.dataframe(
+            information,
+            use_container_width=True
+        )
+
+        # Download cleaned dataset
+        csv_data = df.to_csv(
+            index=False
+        ).encode("utf-8")
+
         st.download_button(
-            "⬇️ Download cleaned CSV",
-            cleaned_csv,
+            "⬇️ Download Cleaned Dataset",
+            data=csv_data,
             file_name="Hyderabad_House_Price_Cleaned.csv",
             mime="text/csv"
         )
 
+
 except Exception as e:
-    st.error(f"Unable to load or process this dataset: {e}")
+
+    st.error(
+        f"Unable to load or process dataset: {e}"
+    )
+
     st.info(
-        "Check that your CSV contains a numeric house-price column "
-        "(such as price(L)) and property details."
+        "Make sure your CSV contains price(L), "
+        "location, title, area_insqft and other "
+        "property details."
     )
